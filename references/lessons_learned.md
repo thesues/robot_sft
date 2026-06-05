@@ -154,3 +154,16 @@ pure-linear assumption under-estimates capacity). Apply it, **re-run preflight t
 fits** (catches a wrong estimate cheaply), then recompute `max_steps`/`save_steps` for the new
 global batch and scale LR with batch. Note: changing batch mid-run isn't a clean resume — tune
 the batch *before* the long launch, not after, since restarting forfeits all prior progress.
+
+## 17. Resumable-checkpoint check must understand DeepSpeed ZeRO format
+**Symptom:** `verify_run.py` reports `resumable: fail` on a perfectly good checkpoint, and the
+watchdog logs "NO resumable checkpoint — restart will be from scratch" even though full state
+was saved — so a crash mid-run would needlessly retrain from zero.
+**Why:** GR00T trains with **DeepSpeed ZeRO**, which does NOT write HF-native `optimizer.pt`.
+Its resumable state lives in a `global_step<N>/` dir (`bf16_zero_pp_rank_*_optim_states.pt` +
+`mp_rank_00_model_states.pt`) with a top-level `latest` file naming that dir. A predicate that
+hard-requires `optimizer.pt`/`scheduler.pt` false-negatives every DeepSpeed checkpoint.
+**Check:** `is_resumable` (in `watchdog.py`, reused by `verify_run.py`) must accept EITHER
+HF-native (`optimizer.pt`) OR DeepSpeed (`latest` → `global_step*/…optim_states.pt`), plus
+`trainer_state.json` (written last ⇒ save finished), RNG, and weights (`.safetensors` or
+`*model_states.pt`). Confirm with a real GR00T checkpoint's contents, not assumptions.

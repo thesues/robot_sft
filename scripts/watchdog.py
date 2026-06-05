@@ -58,18 +58,31 @@ def write_json(path: str, data: dict) -> None:
 
 
 def is_resumable(ckpt_dir: str) -> bool:
-    """A checkpoint can resume only with full HF-Trainer state. trainer_state.json is
-    written last, so its presence also means the save finished. See gr00t_resume.md."""
+    """A checkpoint can resume only with full trainer state. trainer_state.json is written last,
+    so its presence also means the save finished. Optimizer state comes in TWO formats and we
+    must accept both: HF-native `optimizer.pt`, OR DeepSpeed ZeRO — a `latest` file pointing at a
+    `global_step*/` dir of `*_optim_states.pt` shards. GR00T trains with DeepSpeed, so requiring
+    `optimizer.pt` would wrongly call every checkpoint non-resumable. See gr00t_resume.md."""
     try:
-        names = os.listdir(ckpt_dir)
+        names = set(os.listdir(ckpt_dir))
     except OSError:
         return False
-    need = {"trainer_state.json", "optimizer.pt", "scheduler.pt"}
-    if not need.issubset(set(names)):
+    if "trainer_state.json" not in names:
         return False
     has_rng = any(n.startswith("rng_state") for n in names)
-    has_weights = any(n.endswith(".safetensors") for n in names)
-    return has_rng and has_weights
+    has_weights = (any(n.endswith(".safetensors") for n in names)
+                   or any(n.endswith("model_states.pt") for n in names))
+    hf_optim = "optimizer.pt" in names
+    ds_optim = False
+    if "latest" in names:
+        try:
+            tag = open(os.path.join(ckpt_dir, "latest")).read().strip()
+            gdir = os.path.join(ckpt_dir, tag)
+            ds_optim = os.path.isdir(gdir) and any(
+                f.endswith("optim_states.pt") for f in os.listdir(gdir))
+        except OSError:
+            ds_optim = False
+    return has_rng and has_weights and (hf_optim or ds_optim)
 
 
 def latest_resumable_checkpoint(output_dir: str):
