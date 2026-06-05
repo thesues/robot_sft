@@ -31,6 +31,45 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import error_patterns  # noqa: E402
 
 STEP_RE = re.compile(r"(\d+)\s*/\s*(\d+)\s*\[")
+CUDA_RE = re.compile(r"CUDA_VISIBLE_DEVICES=([0-9,]+)")
+
+
+def gpu_ids_from_cmd(cmd: str):
+    m = CUDA_RE.search(cmd)
+    return m.group(1) if m else None
+
+
+def sample_gpu_mem(ids: str):
+    """Return (max_used_mb, total_mb) across the given GPU ids right now, or (0, 0)."""
+    try:
+        q = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.used,memory.total",
+             "--format=csv,noheader,nounits", "-i", ids],
+            capture_output=True, text=True, timeout=10)
+        used, total = 0, 0
+        for line in q.stdout.strip().splitlines():
+            u, t = (int(x) for x in line.split(","))
+            used, total = max(used, u), max(total, t)
+        return used, total
+    except Exception:  # noqa: BLE001
+        return 0, 0
+
+
+def suggest_batch(per_device, num_gpus, peak_mb, total_mb, frac):
+    """Conservatively scale per-device batch to use ~frac of GPU memory. Assuming memory is
+    purely linear in batch UNDER-estimates true capacity (real runs have fixed overhead), so
+    this is a safe lower bound — always re-run preflight at the new batch to confirm."""
+    if not (per_device and peak_mb and total_mb):
+        return None
+    factor = (frac * total_mb) / peak_mb
+    new_pd = int(per_device * factor)
+    new_pd = max(per_device, (new_pd // 1) or per_device)
+    if new_pd <= per_device:
+        return None
+    return {"per_device_batch": new_pd, "global_batch_size": new_pd * max(1, num_gpus),
+            "from_per_device": per_device, "headroom_factor": round(factor, 2),
+            "note": "estimate — set this batch, RE-RUN preflight to confirm it fits, then "
+                    "consider scaling LR with batch and recomputing max_steps/save_steps."}
 
 
 def smoke_command(cmd: str, real_output_dir: str, tmp_dir: str, steps: int) -> str:
@@ -57,8 +96,11 @@ def main() -> None:
     ap.add_argument("--output-dir")
     ap.add_argument("--steps", type=int, default=2)
     ap.add_argument("--timeout", type=int, default=900)
+    ap.add_argument("--mem-frac", type=float, default=0.85,
+                    help="target fraction of GPU memory to fill when suggesting a bigger batch")
     args = ap.parse_args()
 
+    plan = None
     if args.session:
         plan = json.load(open(os.path.join(args.session, "training_plan.json")))
         cmd, real_out = plan["launch_command"], plan["output_dir"]
@@ -71,6 +113,9 @@ def main() -> None:
     log_path = os.path.join(tmp_dir, "preflight.log")
     smoke = smoke_command(cmd, real_out, tmp_dir, args.steps)
     print(f"[preflight] smoke run ({args.steps} steps) -> {tmp_dir}")
+
+    gpu_ids = gpu_ids_from_cmd(cmd)
+    peak_mb, total_mb = 0, 0
 
     logf = open(log_path, "wb")
     proc = subprocess.Popen(["bash", "-lc", smoke], stdout=logf, stderr=subprocess.STDOUT,
@@ -85,6 +130,9 @@ def main() -> None:
             except ProcessLookupError:
                 pass
             break
+        if gpu_ids:  # track peak memory of the training GPUs during the smoke run
+            u, t = sample_gpu_mem(gpu_ids)
+            peak_mb, total_mb = max(peak_mb, u), max(total_mb, t)
         time.sleep(5)
     logf.close()
 
@@ -97,14 +145,29 @@ def main() -> None:
     verdict = {
         "ok": False, "rc": rc, "timed_out": timed_out, "steps_seen": max(steps_seen) if steps_seen else 0,
         "classification": cls, "smoke_output_dir": tmp_dir, "log": log_path,
+        "peak_gpu_mem_mb": peak_mb or None, "gpu_total_mb": total_mb or None,
     }
+    # memory headroom -> suggest a bigger batch (H200 etc. are usually far from full at the
+    # planner's default batch). Only when the smoke run actually progressed and we have a plan.
+    if plan and peak_mb and total_mb:
+        sug = suggest_batch(plan.get("per_device_batch"), plan.get("num_gpus") or plan.get("gpus") or 1,
+                            peak_mb, total_mb, args.mem_frac)
+        if sug:
+            verdict["batch_suggestion"] = sug
     if cls["category"] == "fatal":
         verdict["message"] = f"FATAL config problem before any real cost: {cls['reason']}. {cls['fix']}"
     elif cls["category"] == "oom":
         verdict["message"] = f"OOM at smoke scale: {cls['fix']}"
     elif progressed and (rc == 0 or timed_out):
         verdict["ok"] = True
-        verdict["message"] = f"Training stepped ({verdict['steps_seen']} step(s)) with no fatal signature — safe to launch."
+        msg = f"Training stepped ({verdict['steps_seen']} step(s)) with no fatal signature — safe to launch."
+        if peak_mb and total_mb:
+            msg += f" GPU mem {peak_mb}/{total_mb} MB ({100*peak_mb//total_mb}%)."
+            if verdict.get("batch_suggestion"):
+                s = verdict["batch_suggestion"]
+                msg += (f" Headroom: try per_device_batch {s['from_per_device']}→{s['per_device_batch']} "
+                        f"(global {s['global_batch_size']}) and re-run preflight to confirm.")
+        verdict["message"] = msg
     elif not progressed:
         verdict["message"] = ("No training step completed; model/data init likely failed. "
                               + (cls["fix"] or "Inspect the preflight log."))

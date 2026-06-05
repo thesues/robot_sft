@@ -139,3 +139,18 @@ eval lands **at least hourly** (`plan_training.py --throughput-it-s ... --max-ev
 Also start `eval_watcher.py` with a per-dataset `--eval-timeout` and a small `--threads` cap:
 an eval running next to training otherwise thread-storms into a CUDA-init deadlock, and with
 no timeout one hang silently starves the whole eval curve.
+
+## 16. Right-size the batch from measured memory — the planner flies blind
+**Symptom:** training runs at a small batch (e.g. per_device 16) using a fraction of the GPU
+(28 GB of an H200's 143 GB), leaving throughput on the table — the run is slower than it needs
+to be because the batch was chosen before anyone looked at real memory.
+**Why:** `plan_training.py` sets the batch from a rough mem-per-GPU heuristic *before* the
+model+data are ever loaded. With a frozen backbone (`tune_llm/tune_visual=False`, only
+projector+diffusion trained) optimizer state is tiny and activations dominate, so the true
+headroom is large and very model-specific — unknowable without measuring.
+**Check (stage d):** `preflight.py` samples **peak GPU memory** during the 2-step smoke run and
+emits a `batch_suggestion` (scale `per_device_batch` to ~85% of total, conservative because a
+pure-linear assumption under-estimates capacity). Apply it, **re-run preflight to confirm it
+fits** (catches a wrong estimate cheaply), then recompute `max_steps`/`save_steps` for the new
+global batch and scale LR with batch. Note: changing batch mid-run isn't a clean resume — tune
+the batch *before* the long launch, not after, since restarting forfeits all prior progress.

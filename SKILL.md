@@ -143,6 +143,15 @@ Then **smoke-test before committing GPU-hours**: `python scripts/preflight.py --
 catching gated-backbone / `/dev/shm` / camera-key bugs in ~1–3 min instead of after a 6-hour
 launch. Do not proceed to stage e until preflight is green (or the user accepts the risk).
 
+**Right-size the batch from measured memory (don't fly blind):** the planner picks an initial
+batch *before* seeing real usage, and big GPUs (H200 = 143 GB) are usually far from full —
+especially here, where the backbone is frozen (`tune_llm/tune_visual=False`) so activations,
+not optimizer state, dominate. preflight now samples **peak GPU memory** during the smoke run
+and emits a `batch_suggestion` (scale `per_device_batch` to ~85% of memory). Apply it, **re-run
+preflight to confirm it fits**, then recompute `max_steps`/`save_steps` for the new global batch
+(and consider scaling LR with batch). A bigger batch that fits = higher GPU utilization and a
+faster run (lessons_learned #16).
+
 ### e. Train under watchdog + periodic eval  (the long pole)
 Launch training and the monitors. Three background processes, all communicating via files:
 1. Start the **FastAPI dashboard**: `python scripts/monitor_server.py --session <dir>`
